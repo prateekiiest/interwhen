@@ -11,6 +11,7 @@ Implements proper ToT search using:
 import asyncio
 import json
 import logging
+import re
 from typing import Dict, List, Any, Optional, Tuple
 from dataclasses import dataclass, field
 from enum import Enum
@@ -19,20 +20,13 @@ import time
 from .value_prompts import (
     build_game24_value_prompt,
     build_mcq_value_prompt,
-    build_generic_value_prompt,
     build_tot_value_prompt as build_tot_value_prompt_impl,
-    _detect_tot_task,
 )
 
 logger = logging.getLogger(__name__)
 
 
 # --------------------- Dataset prompt helpers ---------------------
-
-def remove_last_paragraph(text: str) -> str:
-    """Placeholder hook mirroring the TTS baselines (kept for parity)."""
-    return text
-
 
 def build_game24_prompt(nums: List[int]) -> str:
     """Return the canonical Game24 instruction block used across baselines."""
@@ -59,7 +53,7 @@ def build_maze_prompt(example: Dict[str, Any]) -> str:
         "before providing your final answer. Provide the final answer option by "
         "enclosing it within \\boxed{A/B/C/D}."
     )
-    description = remove_last_paragraph(str(example.get("prompt", "")))
+    description = str(example.get("prompt", ""))
     return f"{pre_prompt}\n\n{description.strip()}"
 
 
@@ -71,8 +65,43 @@ def build_spatialmap_prompt(example: Dict[str, Any]) -> str:
         "before providing your final answer. Provide the final answer option by "
         "enclosing it within \\boxed{A/B/C/D}."
     )
-    description = remove_last_paragraph(str(example.get("prompt", "")))
+    description = str(example.get("prompt", ""))
     return f"{pre_prompt}\n\n{description.strip()}"
+
+
+def build_zebralogic_prompt(example: Dict[str, Any]) -> str:
+    """Construct the Zebra Logic puzzle solving instructions for TOT experiments."""
+    puzzle_text = str(example.get("puzzle", ""))
+    prompt = (
+        "# Problem Description\n\n"
+        "You are solving a house grid logic puzzle. You are given:\n"
+        "1. Features and Domains\n"
+        "    - A fixed number of houses, indexed sequentially (e.g., House 1, House 2, …) from left to right.\n"
+        "    - A set of features (e.g., color, name, pet, book genre).\n"
+        "    - Each feature has a finite domain of possible values.\n"
+        "2. Constraints:\n"
+        "    - Each house has exactly one value per feature.\n"
+        "    - No two houses share the same value for the same feature.\n"
+        "3. Clues / Constraints describing:\n"
+        "    - Houses and their positions\n"
+        "    - Feature values\n"
+        "    - Relative ordering (e.g., 'next to', 'to the left of', '2 houses away from')\n\n"
+        "Solve this puzzle to your best ability by determining the arrangement of features across the houses.\n\n"
+        "# Puzzle\n\n"
+        f"{puzzle_text}\n\n"
+        "# Solution Format\n\n"
+        "Provide your final answer in this exact JSON format:\n"
+        "```json\n"
+        '{\n'
+        '    "House 1": { "feature1": "value1", "feature2": "value2", ... },\n'
+        '    "House 2": { "feature1": "value1", "feature2": "value2", ... },\n'
+        '    ...\n'
+        '}\n'
+        "```\n\n"
+        "Make sure to use the exact feature/value names as given in the puzzle.\n"
+        "Ensure the JSON is valid and parsable."
+    )
+    return prompt
 
 
 def build_tot_problem(task: str, example: Dict[str, Any], nums: Optional[List[int]] = None) -> str:
@@ -87,10 +116,13 @@ def build_tot_problem(task: str, example: Dict[str, Any], nums: Optional[List[in
         return build_maze_prompt(example)
     if task_lower == "spatialmap":
         return build_spatialmap_prompt(example)
+    if task_lower == "zebralogic":
+        return build_zebralogic_prompt(example)
     raise ValueError(f"Unsupported task for ToT prompt building: {task}")
 
 
 def build_tot_value_prompt(
+    task: str,
     problem: str,
     trajectory: str,
     use_fewshot: bool = True
@@ -99,6 +131,7 @@ def build_tot_value_prompt(
     Build value prompt for Tree of Thought evaluation.
     
     Args:
+        task: The task type (e.g., "game24", "maze", "spatialmap")
         problem: The original problem statement
         trajectory: Current partial solution (or 'No progress yet' if empty)
         use_fewshot: Whether to use few-shot examples (default True for better evaluation)
@@ -108,7 +141,7 @@ def build_tot_value_prompt(
     """
     if not trajectory.strip():
         trajectory = "No progress yet"
-    return build_tot_value_prompt_impl(problem, trajectory, use_fewshot=use_fewshot)
+    return build_tot_value_prompt_impl(task, problem, trajectory, use_fewshot=use_fewshot)
 
 
 class SearchMethod(Enum):
@@ -183,6 +216,7 @@ class TreeOfThoughtSearch:
     
     async def propose_next_steps(
         self,
+        task: str,
         problem: str,
         current_trajectory: str,
         llm_server: Dict,
@@ -192,6 +226,7 @@ class TreeOfThoughtSearch:
         Generate candidate next steps using the model's propose capability.
         
         Args:
+            task: The task type (e.g., "game24", "maze", "spatialmap")
             problem: The original problem statement
             current_trajectory: Current partial solution
             llm_server: vLLM server config (url, headers, payload template)
@@ -213,6 +248,7 @@ class TreeOfThoughtSearch:
         
         # Build propose prompt
         propose_prompt = self._build_propose_prompt(
+            task,
             problem, 
             current_trajectory, 
             num_proposals
@@ -226,6 +262,12 @@ class TreeOfThoughtSearch:
         
         # Parse proposals from response
         proposals = self._parse_proposals(proposal_text, num_proposals)
+
+        logger.info(
+            "Generated %d proposals at depth hint=%s",
+            len(proposals),
+            "root" if not current_trajectory.strip() else "non-root",
+        )
         
         # Log decision point
         decision_log = {
@@ -233,8 +275,10 @@ class TreeOfThoughtSearch:
             "timestamp": time.time(),
             "problem_hash": hash(problem),
             "trajectory": current_trajectory,
-            "prompt": propose_prompt[:200] + "..." if len(propose_prompt) > 200 else propose_prompt,
-            "raw_response": proposal_text[:300] + "..." if len(proposal_text) > 300 else proposal_text,
+            "prompt": propose_prompt,
+            "prompt_preview": propose_prompt[:200] + "..." if len(propose_prompt) > 200 else propose_prompt,
+            "raw_response": proposal_text,
+            "raw_response_preview": proposal_text[:300] + "..." if len(proposal_text) > 300 else proposal_text,
             "parsed_proposals": proposals,
         }
         self.decision_tree.append(decision_log)
@@ -247,11 +291,17 @@ class TreeOfThoughtSearch:
     
     def _build_propose_prompt(
         self,
+        task: str,
         problem: str,
         trajectory: str,
         num_proposals: int
     ) -> str:
-        """Build a prompt requesting proposals for next steps"""
+        """Build a prompt requesting proposals for next steps."""
+        if task == "maze":
+            return self._build_maze_propose_prompt(problem, trajectory, num_proposals)
+        if task == "spatialmap":
+            return self._build_spatialmap_propose_prompt(problem, trajectory, num_proposals)
+
         return f"""Given the following problem and current progress, propose {num_proposals} possible next steps.
 
 PROBLEM:
@@ -269,44 +319,327 @@ Format each proposal clearly, one per line:
 
 Think step by step about what makes each proposal viable.
 """
+
+    def _detect_maze_question_type(self, problem: str) -> str:
+        """Detect maze subtype for proposal steering (Q0/Q2/Q4)."""
+        lower = problem.lower()
+        if "how many right turns" in lower:
+            logger.debug("Detected Q0: right turn counting")
+            return "q0"
+        if "how many turns" in lower and "right turns" not in lower:
+            logger.debug("Detected Q2: total turn counting")
+            return "q2"
+        if "starting from s" in lower and "where is e" in lower:
+            logger.debug("Detected Q4: spatial relation")
+            return "q4"
+        if "relative" in lower and "s" in lower and "e" in lower:
+            logger.debug("Detected Q4: spatial relation (relative)")
+            return "q4"
+        logger.warning(f"Maze question type not recognized, using generic. Problem preview: {lower[:200]}")
+        return "generic"
+
+    def _extract_last_move_info(self, trajectory: str) -> dict:
+        """Extract previous direction and counter from last step in trajectory."""
+        if not trajectory.strip():
+            return {"prev_direction": None, "right_count": 0, "left_count": 0, "total_count": 0}
+        
+        lines = trajectory.strip().split('\n')
+        last_line = lines[-1] if lines else ""
+        
+        # Try to extract direction from "Next move: [DIRECTION]"
+        import re
+        direction_match = re.search(r'Next move:\s*(UP|DOWN|LEFT|RIGHT)', last_line, re.IGNORECASE)
+        prev_direction = direction_match.group(1).upper() if direction_match else None
+        
+        # Extract counters
+        right_match = re.search(r'Right-turn count:\s*(\d+)', last_line)
+        left_match = re.search(r'Left-turn count:\s*(\d+)', last_line)
+        total_match = re.search(r'Total-turn count:\s*(\d+)', last_line)
+        
+        right_count = int(right_match.group(1)) if right_match else 0
+        left_count = int(left_match.group(1)) if left_match else 0
+        total_count = int(total_match.group(1)) if total_match else 0
+        
+        return {
+            "prev_direction": prev_direction,
+            "right_count": right_count,
+            "left_count": left_count,
+            "total_count": total_count
+        }
+
+    def _build_maze_propose_prompt(
+        self,
+        problem: str,
+        trajectory: str,
+        num_proposals: int,
+    ) -> str:
+        """Build maze-specific atomic next-step proposal prompts by question type."""
+        question_type = self._detect_maze_question_type(problem)
+        logger.debug(f"Detected maze question type: {question_type}")
+        
+        # Extract previous move info for bookkeeping
+        prev_info = self._extract_last_move_info(trajectory)
+        
+        if not trajectory.strip():
+            current = "Starting fresh - no progress yet"
+            last_step_hint = ""
+        else:
+            current = trajectory.strip()
+            lines = current.split('\n')
+            last_line = lines[-1] if lines else ""
+            last_step_hint = f"\nLAST COMPLETED STEP: {last_line}\nNow generate the NEXT move after this (do NOT repeat this move).\n"
+
+        if question_type == "q0":
+            prev_dir = prev_info["prev_direction"]
+            prev_count = prev_info["right_count"]
+            
+            if prev_dir is None:
+                # First move - all directions result in STRAIGHT with count 0
+                examples = f"""PARENT: first move, count=0
+
+Valid answers (pick {num_proposals}):
+Next move: UP | Turn: STRAIGHT | Right-turn count: 0
+Next move: DOWN | Turn: STRAIGHT | Right-turn count: 0
+Next move: LEFT | Turn: STRAIGHT | Right-turn count: 0
+Next move: RIGHT | Turn: STRAIGHT | Right-turn count: 0"""
+            else:
+                # Define turn mappings
+                turn_map = {
+                    "UP": {"RIGHT": "RIGHT", "LEFT": "LEFT", "UP": "STRAIGHT", "DOWN": "STRAIGHT"},
+                    "DOWN": {"LEFT": "RIGHT", "RIGHT": "LEFT", "DOWN": "STRAIGHT", "UP": "STRAIGHT"},
+                    "LEFT": {"UP": "RIGHT", "DOWN": "LEFT", "LEFT": "STRAIGHT", "RIGHT": "STRAIGHT"},
+                    "RIGHT": {"DOWN": "RIGHT", "UP": "LEFT", "RIGHT": "STRAIGHT", "LEFT": "STRAIGHT"}
+                }
+                
+                moves = turn_map.get(prev_dir, {})
+                examples_list = []
+                for next_dir, turn_type in moves.items():
+                    new_count = prev_count + 1 if turn_type == "RIGHT" else prev_count
+                    examples_list.append(f"Next move: {next_dir} | Turn: {turn_type} | Right-turn count: {new_count}")
+                
+                examples = f"""PARENT: direction={prev_dir}, count={prev_count}
+
+Valid answers (pick {num_proposals}):
+{chr(10).join(examples_list)}"""
+            
+            return f"""{examples}
+
+DO NOT explain. DO NOT reason. Just output {num_proposals} lines from above."""
+
+        if question_type == "q2":
+            prev_dir = prev_info["prev_direction"]
+            prev_count = prev_info["total_count"]
+            
+            if prev_dir is None:
+                examples = f"""PARENT: first move, count=0
+
+Valid answers (pick {num_proposals}):
+Next move: UP | Turn: STRAIGHT | Total-turn count: 0
+Next move: DOWN | Turn: STRAIGHT | Total-turn count: 0
+Next move: LEFT | Turn: STRAIGHT | Total-turn count: 0
+Next move: RIGHT | Turn: STRAIGHT | Total-turn count: 0"""
+            else:
+                # Define turn mappings (same as Q0)
+                turn_map = {
+                    "UP": {"RIGHT": "RIGHT", "LEFT": "LEFT", "UP": "STRAIGHT", "DOWN": "STRAIGHT"},
+                    "DOWN": {"LEFT": "RIGHT", "RIGHT": "LEFT", "DOWN": "STRAIGHT", "UP": "STRAIGHT"},
+                    "LEFT": {"UP": "RIGHT", "DOWN": "LEFT", "LEFT": "STRAIGHT", "RIGHT": "STRAIGHT"},
+                    "RIGHT": {"DOWN": "RIGHT", "UP": "LEFT", "RIGHT": "STRAIGHT", "LEFT": "STRAIGHT"}
+                }
+                
+                moves = turn_map.get(prev_dir, {})
+                examples_list = []
+                for next_dir, turn_type in moves.items():
+                    new_count = prev_count + 1 if turn_type in ["RIGHT", "LEFT"] else prev_count
+                    examples_list.append(f"Next move: {next_dir} | Turn: {turn_type} | Total-turn count: {new_count}")
+                
+                examples = f"""PARENT: direction={prev_dir}, count={prev_count}
+
+Valid answers (pick {num_proposals}):
+{chr(10).join(examples_list)}"""
+            
+            return f"""{examples}
+
+DO NOT explain. DO NOT reason. Just output {num_proposals} lines from above."""
+
+        if question_type == "q4":
+            # Q4 should also be structured - no long reasoning
+            return f"""Maze spatial question. Generate {num_proposals} brief factual statements.
+
+{current if current else "Starting."}
+
+Output {num_proposals} lines. Each line: one short fact. NO long explanations."""
+
+        # Generic fallback - also keep it structured
+        return f"""Maze question. Generate {num_proposals} next steps.
+
+{current if current else "Starting."}
+
+Output {num_proposals} lines. Each line: one short step. NO explanations."""
+
+    def _detect_spatialmap_question_type(self, problem: str) -> str:
+        """Detect spatialmap subtype for proposal steering (direction/object/counting)."""
+        lower = problem.lower()
+        if "how many" in lower and ("objects" in lower or "places" in lower or "locations" in lower):
+            return "counting"
+        if "which object" in lower or "what object" in lower or "which place" in lower or "which location" in lower:
+            return "object"
+        if "in which direction" in lower or "what direction" in lower or "relative to" in lower:
+            return "direction"
+        return "generic"
+
+    def _build_spatialmap_propose_prompt(
+        self,
+        problem: str,
+        trajectory: str,
+        num_proposals: int,
+    ) -> str:
+        """Build spatialmap-specific atomic next-step proposal prompts by question type."""
+        question_type = self._detect_spatialmap_question_type(problem)
+        logger.debug(f"Detected spatialmap question type: {question_type}")
+
+        if not trajectory.strip():
+            current = "Starting fresh - no progress yet"
+            last_step_hint = ""
+        else:
+            current = trajectory.strip()
+            lines = [line.strip() for line in current.split("\n") if line.strip()]
+            last_line = lines[-1] if lines else ""
+            last_step_hint = (
+                f"\nLAST COMPLETED STEP: {last_line}\n"
+                "Now generate the NEXT atomic step after this (do NOT repeat this step).\n"
+            )
+
+        if question_type == "direction":
+            return f"""You are solving a spatial-map DIRECTION question.
+
+PROBLEM:
+{problem}
+
+TRAJECTORY SO FAR:
+{current}
+{last_step_hint}
+Your task: Propose {num_proposals} ATOMIC next steps only.
+- Each step must advance exactly ONE concrete spatial inference
+- Prefer one of: parse one relation, apply reversibility once, apply transitivity once, or map target-vs-reference direction
+- Do NOT restate the whole map
+
+Output format (one line per proposal, no preamble):
+1. [Atomic spatial inference]
+2. [Atomic spatial inference]
+..."""
+
+        if question_type == "object":
+            return f"""You are solving a spatial-map OBJECT-IDENTIFICATION question.
+
+PROBLEM:
+{problem}
+
+TRAJECTORY SO FAR:
+{current}
+{last_step_hint}
+Your task: Propose {num_proposals} ATOMIC next steps only.
+- Each step should do one action: identify candidate set, eliminate one candidate, or validate one relation against query direction
+- Keep steps local and specific to the asked direction/object
+- Do NOT rewrite all relationships
+
+Output format (one line per proposal, no preamble):
+1. [Atomic candidate/evidence step]
+2. [Atomic candidate/evidence step]
+..."""
+
+        if question_type == "counting":
+            return f"""You are solving a spatial-map COUNTING question.
+
+PROBLEM:
+{problem}
+
+TRAJECTORY SO FAR:
+{current}
+{last_step_hint}
+Your task: Propose {num_proposals} ATOMIC next steps only.
+- Each step should do one action: identify one qualifying object, rule out one object, or update running count by exactly one justified change
+- Keep a clear running count state
+- Do NOT provide final answer yet unless count is fully justified
+
+Output format (one line per proposal, no preamble):
+1. [Atomic counting step, e.g., "Qualifies: <object>; running count = n"]
+2. [Atomic counting step, e.g., "Ruled out: <object>; running count = n"]
+..."""
+
+        return f"""You are solving a spatial-map reasoning question.
+
+PROBLEM:
+{problem}
+
+TRAJECTORY SO FAR:
+{current}
+{last_step_hint}
+Propose {num_proposals} atomic, actionable next steps.
+Each step must add ONE new spatial fact/inference and be different from prior steps.
+
+Output format (one line per proposal, no preamble):
+1. ...
+2. ...
+..."""
     
     def _parse_proposals(self, response: str, num_proposals: int) -> List[str]:
         """
         Parse proposals from model response.
         Handles various formats (numbered lists, bullets, etc.)
         """
-        lines = response.split('\n')
-        proposals = []
-        
-        for line in lines:
+        proposals: List[str] = []
+
+        # First, try to extract exact format lines: "Next move: X | Turn: Y | ...count: Z"
+        # Match line by line to avoid cross-line pollution
+        for line in response.split('\n'):
             line = line.strip()
-            # Skip empty lines and headers
-            if not line or line in ["Next steps:", "Proposals:", "possible next steps"]:
-                continue
-            
-            # Remove common prefixes (1., -, •, etc.)
-            for prefix in ['1.', '2.', '3.', '4.', '5.', '-', '•', '*']:
-                if line.startswith(prefix):
-                    line = line[len(prefix):].strip()
-                    break
-            
-            # Remove bracketed numbers like [1]
-            if line and line[0].isdigit() and']' in line:
-                line = line[line.index(']')+1:].strip()
-            
-            if line and len(line) > 3:  # Minimum reasonable length
+            # Check if it matches our exact format
+            if 'Next move:' in line and 'Turn:' in line and 'count:' in line:
                 proposals.append(line)
-            
+                if len(proposals) >= num_proposals:
+                    return proposals[:num_proposals]
+
+        # If we got enough exact format proposals, return them
+        if len(proposals) >= num_proposals:
+            return proposals[:num_proposals]
+
+        # Fallback: numbered multiline blocks (preserve continuation lines)
+        numbered_blocks = re.findall(
+            r"(?:^|\n)\s*\d+[\.)]\s*(.+?)(?=(?:\n\s*\d+[\.)]\s*)|\Z)",
+            response,
+            flags=re.DOTALL,
+        )
+        for block in numbered_blocks:
+            cleaned = " ".join(block.strip().split())
+            if cleaned and len(cleaned) > 3:
+                proposals.append(cleaned)
             if len(proposals) >= num_proposals:
-                break
-        
-        # If we couldn't parse enough, return what we have
+                return proposals[:num_proposals]
+
+        # Second pass: fallback line parser for bullets/single-line proposals
+        for line in response.split("\n"):
+            cleaned = line.strip()
+            if not cleaned or cleaned in ["Next steps:", "Proposals:", "possible next steps"]:
+                continue
+
+            cleaned = re.sub(r"^\s*(?:\d+[\.)]|[-•*])\s*", "", cleaned)
+            cleaned = re.sub(r"^\s*\[\d+\]\s*", "", cleaned)
+            cleaned = re.sub(r"^\s*proposal\s*[:\-]\s*", "", cleaned, flags=re.IGNORECASE)
+            cleaned = " ".join(cleaned.split())
+
+            if cleaned and len(cleaned) > 3:
+                proposals.append(cleaned)
+            if len(proposals) >= num_proposals:
+                return proposals[:num_proposals]
+
         return proposals[:num_proposals]
     
     # ===================== EVALUATE FUNCTION =====================
     
     async def evaluate_state(
         self,
+        task: str,
         problem: str,
         trajectory: str,
         llm_server: Dict,
@@ -315,6 +648,7 @@ Think step by step about what makes each proposal viable.
         Evaluate the quality/progress of current state.
         
         Args:
+            task: The task type (e.g., "game24", "maze", "spatialmap")
             problem: Original problem
             trajectory: Current solution trajectory
             llm_server: vLLM server config
@@ -331,13 +665,14 @@ Think step by step about what makes each proposal viable.
         self.search_stats["evaluations_performed"] += 1
         
         # Build evaluation prompt
-        eval_prompt = self._build_evaluation_prompt(problem, trajectory)
+        eval_prompt = self._build_evaluation_prompt(task, problem, trajectory)
         
         # Call model
         eval_response = await self._call_llm_streaming(llm_server, eval_prompt)
         
         # Parse evaluation into score
         score = self._parse_evaluation(eval_response)
+        confidence_label = self._extract_confidence_label(eval_response, score)
         
         # Log evaluation
         eval_log = {
@@ -347,6 +682,7 @@ Think step by step about what makes each proposal viable.
             "prompt_preview": eval_prompt[:200] + "...",
             "response_preview": eval_response[:200] + "...",
             "score": score,
+            "confidence": confidence_label,
         }
         if self.decision_tree:
             if "evaluations" not in self.decision_tree[-1]:
@@ -359,9 +695,9 @@ Think step by step about what makes each proposal viable.
         
         return score
     
-    def _build_evaluation_prompt(self, problem: str, trajectory: str) -> str:
+    def _build_evaluation_prompt(self, task: str, problem: str, trajectory: str) -> str:
         """Build dataset-aware evaluation prompts reused by ToT scoring."""
-        return build_tot_value_prompt(problem, trajectory)
+        return build_tot_value_prompt(task, problem, trajectory)
     
     def _parse_evaluation(self, response: str) -> float:
         """
@@ -389,11 +725,68 @@ Think step by step about what makes each proposal viable.
                     return digit / 9.0  # Normalize to [0, 1]
         
         return 0.5  # Default neutral score
+
+    def _score_to_confidence(self, score: float) -> str:
+        """Map scalar score [0,1] to confidence bucket."""
+        if score >= 0.8:
+            return "sure"
+        if score >= 0.6:
+            return "likely"
+        if score >= 0.4:
+            return "possible"
+        if score >= 0.2:
+            return "unlikely"
+        return "impossible"
+
+    def _extract_confidence_label(self, response: str, score: float) -> str:
+        """Extract confidence label from value response; fallback to score mapping."""
+        lower = response.lower()
+        for label in ["sure", "likely", "possible", "unlikely", "impossible"]:
+            if label in lower:
+                return label
+        return self._score_to_confidence(score)
+
+    def _log_proposal_transition(
+        self,
+        depth: int,
+        parent_trajectory: str,
+        proposal: str,
+        next_state: str,
+        value: float,
+        is_terminal: bool,
+        pruned: bool,
+    ) -> None:
+        """Log proposal -> next-state -> value transition for debugging/analysis."""
+        self.decision_tree.append(
+            {
+                "type": "proposal_transition",
+                "timestamp": time.time(),
+                "depth": depth,
+                "parent_trajectory": parent_trajectory,
+                "proposal": proposal,
+                "next_state": next_state,
+                "value": value,
+                "value_confidence": self._score_to_confidence(value),
+                "is_terminal": is_terminal,
+                "pruned": pruned,
+            }
+        )
+
+        logger.info(
+            "ToT transition | depth=%d | proposal=%s | value=%.3f | confidence=%s | pruned=%s | terminal=%s",
+            depth,
+            proposal,
+            value,
+            self._score_to_confidence(value),
+            pruned,
+            is_terminal,
+        )
     
     # ===================== SEARCH IMPLEMENTATION =====================
     
     async def search(
         self,
+        task: str,
         problem: str,
         llm_server: Dict,
     ) -> Dict[str, Any]:
@@ -401,6 +794,7 @@ Think step by step about what makes each proposal viable.
         Perform Tree of Thought search on the problem.
         
         Args:
+            task: The task type (e.g., "game24", "maze", "spatialmap")
             problem: Problem statement
             llm_server: vLLM server config
             
@@ -413,13 +807,13 @@ Think step by step about what makes each proposal viable.
         self.root = TreeNode(trajectory="", depth=0, value=0.5)
         
         if self.config.search_method == SearchMethod.BFS:
-            return await self._bfs_search(problem, llm_server)
+            return await self._bfs_search(task, problem, llm_server)
         elif self.config.search_method == SearchMethod.BEAM:
-            return await self._beam_search(problem, llm_server)
+            return await self._beam_search(task, problem, llm_server)
         else:
-            return await self._dfs_search(problem, llm_server)
+            return await self._dfs_search(task, problem, llm_server)
     
-    async def _bfs_search(self, problem: str, llm_server: Dict) -> Dict[str, Any]:
+    async def _bfs_search(self, task: str, problem: str, llm_server: Dict) -> Dict[str, Any]:
         """Breadth-First Search implementation"""
         queue = [self.root]
         best_terminal = None
@@ -436,6 +830,7 @@ Think step by step about what makes each proposal viable.
             for node in queue:
                 # Generate proposals
                 proposals = await self.propose_next_steps(
+                    task,
                     problem,
                     node.trajectory,
                     llm_server,
@@ -453,7 +848,7 @@ Think step by step about what makes each proposal viable.
                     )
                     
                     # Evaluate
-                    value = await self.evaluate_state(problem, new_trajectory, llm_server)
+                    value = await self.evaluate_state(task, problem, new_trajectory, llm_server)
                     child.value = value
                     
                     # Track best candidate regardless of terminal status
@@ -468,15 +863,46 @@ Think step by step about what makes each proposal viable.
                         if value > best_value:
                             best_value = value
                             best_terminal = child
+                        is_terminal = True
                         
                         # Early termination if high confidence
                         if self.config.early_termination and value >= self.config.sure_threshold:
+                            self._log_proposal_transition(
+                                depth=depth + 1,
+                                parent_trajectory=node.trajectory,
+                                proposal=prop,
+                                next_state=new_trajectory,
+                                value=value,
+                                is_terminal=is_terminal,
+                                pruned=False,
+                            )
                             return self._format_search_result(best_terminal, problem)
+                    else:
+                        is_terminal = False
                     
                     # Prune low-value nodes
                     if value < self.config.impossible_threshold:
                         self.search_stats["branches_pruned"] += 1
+                        self._log_proposal_transition(
+                            depth=depth + 1,
+                            parent_trajectory=node.trajectory,
+                            proposal=prop,
+                            next_state=new_trajectory,
+                            value=value,
+                            is_terminal=is_terminal,
+                            pruned=True,
+                        )
                         continue
+
+                    self._log_proposal_transition(
+                        depth=depth + 1,
+                        parent_trajectory=node.trajectory,
+                        proposal=prop,
+                        next_state=new_trajectory,
+                        value=value,
+                        is_terminal=is_terminal,
+                        pruned=False,
+                    )
                     
                     node.children.append(child)
                     next_queue.append(child)
@@ -486,7 +912,7 @@ Think step by step about what makes each proposal viable.
         
         return self._format_search_result(best_terminal or best_candidate, problem)
     
-    async def _beam_search(self, problem: str, llm_server: Dict) -> Dict[str, Any]:
+    async def _beam_search(self, task: str, problem: str, llm_server: Dict) -> Dict[str, Any]:
         """Beam Search implementation"""
         beam = [self.root]
         best_terminal = None
@@ -500,16 +926,17 @@ Think step by step about what makes each proposal viable.
             for node in beam:
                 # Generate and evaluate proposals
                 proposals = await self.propose_next_steps(
+                    task,
                     problem,
                     node.trajectory,
                     llm_server,
                     self.config.branching_factor
                 )
                 node.proposals = proposals
-                
+
                 for prop in proposals:
                     new_trajectory = f"{node.trajectory}\n{prop}" if node.trajectory else prop
-                    value = await self.evaluate_state(problem, new_trajectory, llm_server)
+                    value = await self.evaluate_state(task, problem, new_trajectory, llm_server)
                     
                     child = TreeNode(
                         trajectory=new_trajectory,
@@ -531,9 +958,38 @@ Think step by step about what makes each proposal viable.
                         if value > best_value:
                             best_value = value
                             best_terminal = child
+                        is_terminal = True
                         
                         if self.config.early_termination and value >= self.config.sure_threshold:
+                            self._log_proposal_transition(
+                                depth=depth + 1,
+                                parent_trajectory=node.trajectory,
+                                proposal=prop,
+                                next_state=new_trajectory,
+                                value=value,
+                                is_terminal=is_terminal,
+                                pruned=False,
+                            )
                             return self._format_search_result(best_terminal, problem)
+                    else:
+                        is_terminal = False
+
+                    pruned = value < self.config.impossible_threshold
+                    if pruned:
+                        self.search_stats["branches_pruned"] += 1
+
+                    self._log_proposal_transition(
+                        depth=depth + 1,
+                        parent_trajectory=node.trajectory,
+                        proposal=prop,
+                        next_state=new_trajectory,
+                        value=value,
+                        is_terminal=is_terminal,
+                        pruned=pruned,
+                    )
+
+                    if pruned:
+                        continue
             
             # Keep top-k by value
             candidates.sort(key=lambda x: x[1], reverse=True)
@@ -544,7 +1000,7 @@ Think step by step about what makes each proposal viable.
         
         return self._format_search_result(best_terminal or best_candidate, problem)
     
-    async def _dfs_search(self, problem: str, llm_server: Dict) -> Dict[str, Any]:
+    async def _dfs_search(self, task: str, problem: str, llm_server: Dict) -> Dict[str, Any]:
         """Depth-First Search implementation"""
         best_terminal = None
         best_value = 0.0
@@ -559,6 +1015,7 @@ Think step by step about what makes each proposal viable.
             
             # Generate proposals
             proposals = await self.propose_next_steps(
+                task,
                 problem,
                 node.trajectory,
                 llm_server,
@@ -568,7 +1025,7 @@ Think step by step about what makes each proposal viable.
             
             for prop in proposals:
                 new_trajectory = f"{node.trajectory}\n{prop}" if node.trajectory else prop
-                value = await self.evaluate_state(problem, new_trajectory, llm_server)
+                value = await self.evaluate_state(task, problem, new_trajectory, llm_server)
                 
                 child = TreeNode(
                     trajectory=new_trajectory,
@@ -589,15 +1046,45 @@ Think step by step about what makes each proposal viable.
                     if value > best_value:
                         best_value = value
                         best_terminal = child
+                    is_terminal = True
                     
                     if self.config.early_termination and value >= self.config.sure_threshold:
+                        self._log_proposal_transition(
+                            depth=depth + 1,
+                            parent_trajectory=node.trajectory,
+                            proposal=prop,
+                            next_state=new_trajectory,
+                            value=value,
+                            is_terminal=is_terminal,
+                            pruned=False,
+                        )
                         return
+                else:
+                    is_terminal = False
                 
                 # Prune
                 if value >= self.config.impossible_threshold:
+                    self._log_proposal_transition(
+                        depth=depth + 1,
+                        parent_trajectory=node.trajectory,
+                        proposal=prop,
+                        next_state=new_trajectory,
+                        value=value,
+                        is_terminal=is_terminal,
+                        pruned=False,
+                    )
                     await dfs(child, depth + 1)
                 else:
                     self.search_stats["branches_pruned"] += 1
+                    self._log_proposal_transition(
+                        depth=depth + 1,
+                        parent_trajectory=node.trajectory,
+                        proposal=prop,
+                        next_state=new_trajectory,
+                        value=value,
+                        is_terminal=is_terminal,
+                        pruned=True,
+                    )
         
         await dfs(self.root, 0)
         return self._format_search_result(best_terminal or best_candidate, problem)
@@ -683,3 +1170,99 @@ Think step by step about what makes each proposal viable.
             "decision_points": self.decision_tree,
             "num_decision_points": len(self.decision_tree),
         }, indent=2, default=str)
+
+    def _serialize_node(self, node: Optional[TreeNode], max_depth: Optional[int] = None) -> Optional[Dict[str, Any]]:
+        """Serialize tree nodes recursively for debugging/state inspection."""
+        if node is None:
+            return None
+
+        if max_depth is not None and node.depth >= max_depth:
+            return {
+                "depth": node.depth,
+                "value": node.value,
+                "is_terminal": node.is_terminal,
+                "trajectory": node.trajectory,
+                "num_children": len(node.children),
+                "children": [],
+                "truncated": True,
+            }
+
+        return {
+            "depth": node.depth,
+            "value": node.value,
+            "is_terminal": node.is_terminal,
+            "trajectory": node.trajectory,
+            "num_children": len(node.children),
+            "children": [self._serialize_node(child, max_depth=max_depth) for child in node.children],
+        }
+
+    def get_state_snapshot(
+        self,
+        include_tree: bool = True,
+        max_tree_depth: Optional[int] = None,
+        decision_tail: Optional[int] = 50,
+        include_cache_samples: bool = True,
+        cache_sample_size: int = 5,
+    ) -> Dict[str, Any]:
+        """Return a comprehensive snapshot of the current ToT search state."""
+        proposal_cache_keys = list(self.proposal_cache.keys())
+        evaluation_cache_keys = list(self.evaluation_cache.keys())
+
+        snapshot: Dict[str, Any] = {
+            "config": {
+                "branching_factor": self.config.branching_factor,
+                "max_depth": self.config.max_depth,
+                "search_method": self.config.search_method.value,
+                "beam_width": self.config.beam_width,
+                "sure_threshold": self.config.sure_threshold,
+                "likely_threshold": self.config.likely_threshold,
+                "impossible_threshold": self.config.impossible_threshold,
+                "early_termination": self.config.early_termination,
+                "cache_evaluations": self.config.cache_evaluations,
+                "max_candidates_per_level": self.config.max_candidates_per_level,
+            },
+            "search_stats": dict(self.search_stats),
+            "decision_tree_size": len(self.decision_tree),
+            "cache_state": {
+                "proposal_cache_size": len(self.proposal_cache),
+                "evaluation_cache_size": len(self.evaluation_cache),
+            },
+            "root_present": self.root is not None,
+            "root_depth": self.root.depth if self.root is not None else None,
+            "root_value": self.root.value if self.root is not None else None,
+            "root_is_terminal": self.root.is_terminal if self.root is not None else None,
+        }
+
+        if decision_tail is None:
+            snapshot["decision_tree"] = self.decision_tree
+        else:
+            snapshot["decision_tree_tail"] = self.decision_tree[-decision_tail:]
+
+        if include_cache_samples:
+            sample_size = max(0, cache_sample_size)
+            snapshot["cache_state"]["proposal_cache_key_samples"] = proposal_cache_keys[:sample_size]
+            snapshot["cache_state"]["evaluation_cache_key_samples"] = evaluation_cache_keys[:sample_size]
+
+        if include_tree:
+            snapshot["tree"] = self._serialize_node(self.root, max_depth=max_tree_depth)
+
+        return snapshot
+
+    def get_state_snapshot_json(
+        self,
+        include_tree: bool = True,
+        max_tree_depth: Optional[int] = None,
+        decision_tail: Optional[int] = 50,
+        include_cache_samples: bool = True,
+        cache_sample_size: int = 5,
+        indent: int = 2,
+    ) -> str:
+        """Return JSON string for the current ToT state snapshot."""
+        snapshot = self.get_state_snapshot(
+            include_tree=include_tree,
+            max_tree_depth=max_tree_depth,
+            decision_tail=decision_tail,
+            include_cache_samples=include_cache_samples,
+            cache_sample_size=cache_sample_size,
+        )
+        return json.dumps(snapshot, indent=indent, default=str)

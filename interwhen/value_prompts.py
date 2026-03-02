@@ -101,7 +101,7 @@ Rate confidence on this rubric:
 - unlikely (3): Numbers seem misaligned 
 - impossible (1): Numbers cannot reach 24
 
-Respond with "Confidence: <level>" and brief justification."""
+Respond with "Confidence: <level>" and brief justification.
 """
 
 # ============================================================================
@@ -118,14 +118,14 @@ MODEL TRAJECTORY:
 
 EXAMPLE 1 - SURE:
 Question: Count right turns in path X from S to E
-Trajectory: Carefully trace X-marked path. Starting at S, move UP (initial direction). Then RIGHT (90° clockwise = right turn 1). Then DOWN (90° clockwise = right turn 2). Then RIGHT (90° clockwise = right turn 3). Continuing pattern: 6 right turns total.
+Trajectory: Carefully trace X-marked path. Starting at S, move UP (initial direction). Then RIGHT (90 degrees clockwise = right turn 1). Then DOWN (90 degrees clockwise = right turn 2). Then RIGHT (90 degrees clockwise = right turn 3). Continuing pattern: 6 right turns total.
 Answer: B (6 right turns)
 Analysis: Systematic path tracing with correct turn geometry, defensible count.
 Confidence: sure (9)
 
 EXAMPLE 2 - SURE:
-Question: What's the sequence of grid direction?
-Trajectory: Following marked path from S: [0,0] → [0,1] (UP) → [1,1] (RIGHT) → [1,0] (DOWN) → [2,0] (RIGHT). Each step verified against grid.
+Question: What is the sequence of grid direction?
+Trajectory: Following marked path from S: [0,0] then [0,1] (UP) then [1,1] (RIGHT) then [1,0] (DOWN) then [2,0] (RIGHT). Each step verified against grid.
 Answer: UP, RIGHT, DOWN, RIGHT
 Analysis: Clear coordinate tracking, systematic verification.
 Confidence: sure (9)
@@ -248,7 +248,74 @@ Judge if the reasoning correctly applies spatial relationships (north, south, ea
 Use the confidence rubric: sure/certain (9), likely/probably (7), possible/maybe (5), unlikely/doubtful (3), impossible/blocked (1).
 Respond with "Confidence: <category>" plus a concise explanation that references the spatial relationships and locations.
 """
+# ============================================================================
+# ZEBRA LOGIC VALUE PROMPTS WITH FEW-SHOT EXAMPLES
+# ============================================================================
 
+ZEBRALOGIC_VALUE_PROMPT_WITH_FEWSHOT = """Evaluate a Zebra Logic puzzle solution trajectory.
+
+TASK PROMPT:
+{problem}
+
+MODEL TRAJECTORY:
+{trajectory}
+
+Here are examples of how to evaluate Zebra Logic trajectories:
+
+EXAMPLE 1 - SURE:
+Puzzle: Houses with colors, pets, beverages, and nationalities with clues about relationships.
+Trajectory: I've systematically worked through the constraints. House 1 has British resident. Red house owner has Panda. Coffee drinker speaks Japanese. Working through elimination, I've determined all houses uniquely and the solution satisfies all clues without contradictions.
+Analysis: Systematic constraint satisfaction with clear justification for each assignment. Solution verifiable.
+Confidence: sure (9)
+
+EXAMPLE 2 - LIKELY:
+Trajectory: Working through the clues methodically. I've identified several definite assignments (House 2 has Swedish resident with bird). For the remaining houses, the constraints are narrowing down possibilities and should lead to a unique solution.
+Analysis: Reasonable progress using logic, but not yet complete verification of all constraints.
+Confidence: likely (7)
+
+EXAMPLE 3 - POSSIBLE:
+Trajectory: I understand the puzzle structure. I'm working through clues but some deductions are unclear to me. I think House 1 might have the British resident, but I'm not certain.
+Analysis: Shows problem understanding but lacks decisive constraint application.
+Confidence: possible (5)
+
+EXAMPLE 4 - UNLIKELY:
+Trajectory: I'm trying to assign attributes to houses. House 1 has red color and Swedish resident. House 2 has green... wait, but green is next to red. I'm getting confused by the adjacency constraints.
+Analysis: Fundamental misunderstanding of spatial/logical constraints.
+Confidence: unlikely (3)
+
+EXAMPLE 5 - IMPOSSIBLE:
+Trajectory: I'm going to assign all attributes randomly since I don't see how the clues relate to each other.
+Analysis: Abandons logical reasoning without attempting systematic constraint satisfaction.
+Confidence: impossible (1)
+
+Rubric for Zebra Logic:
+- sure (9): Complete solution derived with clear constraint verification, all assignments justified
+- likely (7): Systematic progress with mostly confident deductions, minor uncertainties remain
+- possible (5): Some correct deductions but missing clear constraint application
+- unlikely (3): Attempting logic but making errors in constraint application or showing confusion
+- impossible (1): No meaningful attempt at systematic constraint satisfaction
+
+Respond with "Confidence: <level>" followed by brief justification referencing the logical deductions and constraint satisfaction.
+"""
+
+ZEBRALOGIC_VALUE_PROMPT_SIMPLE = """Evaluate a Zebra Logic puzzle solution trajectory.
+
+TASK PROMPT:
+{problem}
+
+MODEL TRAJECTORY:
+{trajectory}
+
+Judge if the reasoning systematically applies logical constraints and whether the solution assignments are well-justified.
+Use the confidence rubric:
+- sure (9): Complete solution with clear constraint verification
+- likely (7): Systematic progress with mostly confident deductions
+- possible (5): Some correct deductions with minor gaps
+- unlikely (3): Attempting logic but making constraint errors
+- impossible (1): No meaningful systematic reasoning
+
+Respond with "Confidence: <level>" and brief justification referencing constraint satisfaction.
+"""
 # ============================================================================
 # GENERIC VALUE PROMPT
 # ============================================================================
@@ -333,11 +400,20 @@ def build_generic_value_prompt(problem: str, trajectory: str, use_fewshot: bool 
         return GENERIC_VALUE_PROMPT_SIMPLE.format(problem=problem, trajectory=trajectory)
 
 
-def build_tot_value_prompt(problem: str, trajectory: str, use_fewshot: bool = True) -> str:
+def build_zebralogic_value_prompt(problem: str, trajectory: str, use_fewshot: bool = True) -> str:
+    """Build zebralogic value prompt with or without few-shot examples."""
+    if use_fewshot:
+        return ZEBRALOGIC_VALUE_PROMPT_WITH_FEWSHOT.format(problem=problem, trajectory=trajectory)
+    else:
+        return ZEBRALOGIC_VALUE_PROMPT_SIMPLE.format(problem=problem, trajectory=trajectory)
+
+
+def build_tot_value_prompt(task: str, problem: str, trajectory: str, use_fewshot: bool = True) -> str:
     """
     Build value prompt for Tree of Thought evaluation.
     
     Args:
+        task: The task type (e.g., "game24", "maze", "spatialmap", "zebralogic")
         problem: The original problem statement
         trajectory: Current partial solution
         use_fewshot: Whether to use few-shot examples (default True)
@@ -345,23 +421,12 @@ def build_tot_value_prompt(problem: str, trajectory: str, use_fewshot: bool = Tr
     Returns:
         Formatted value prompt
     """
-    task = _detect_tot_task(problem)
     if task == "game24":
         return build_game24_value_prompt(problem, trajectory, use_fewshot)
     if task == "maze":
         return build_mcq_value_prompt(problem, trajectory, "maze", use_fewshot)
     if task == "spatialmap":
         return build_mcq_value_prompt(problem, trajectory, "spatial reasoning", use_fewshot)
+    if task == "zebralogic":
+        return build_zebralogic_value_prompt(problem, trajectory, use_fewshot)
     return build_generic_value_prompt(problem, trajectory, use_fewshot)
-
-
-def _detect_tot_task(problem_text: str) -> str:
-    """Lightweight heuristic to infer dataset type from the problem statement."""
-    lower = problem_text.lower()
-    if "game of 24" in lower or "game24" in lower:
-        return "game24"
-    if "spatial" in lower and "map" in lower:
-        return "spatialmap"
-    if "maze" in lower:
-        return "maze"
-    return "generic"
